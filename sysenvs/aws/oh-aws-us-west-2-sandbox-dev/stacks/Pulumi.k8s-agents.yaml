@@ -1,0 +1,18 @@
+---
+encryptionsalt: v1:<REDACTED>
+config:
+  ami:name_prefix_override: oh-kubernetes-1.22
+  aws:region: us-west-2
+  k8s-agents:agents:
+    - enable_glb: false
+      docker_registry_cache: http://container-registry-cache.container-registry.svc.oh-aws-us-west-2-sandbox-dev.oh:5000
+      nodegroups:
+        - dockervol_size_gb: 100
+          instance_type: t3.xlarge
+          labels:
+            - default_node
+            - general
+          max_size: 13
+          min_size: 3
+          name: default
+          spot_instances: true

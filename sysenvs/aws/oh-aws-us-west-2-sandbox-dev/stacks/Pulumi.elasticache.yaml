@@ -1,0 +1,14 @@
+---
+encryptionsalt: v1:<REDACTED>
+config:
+  aws:region: us-west-2
+  elasticache:replication_groups:
+    - automatic_failover: true
+      availability_zones:
+        - us-west-2c
+      engine: redis
+      engine_version: 6.x
+      instance_type: cache.r6g.large
+      name: app
+      num_node_groups: 2
+      replicas_per_node_group: 5

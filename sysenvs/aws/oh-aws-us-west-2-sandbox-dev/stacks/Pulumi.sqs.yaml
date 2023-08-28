@@ -1,0 +1,20 @@
+---
+encryptionsalt: v1:<REDACTED>
+config:
+  aws:region: us-west-2
+  sqs:queues:
+    - deduplication:
+        content_based: false
+        scope: messageGroup
+      fifo: true
+      fifo_throughput_limit: perMessageGroupId
+      name: myqueue1
+      retention_seconds: 86400
+    - fifo: false
+      name: myqueue2
+    - deduplication:
+        content_based: true
+        scope: queue
+      fifo: true
+      fifo_throughput_limit: perQueue
+      name: myqueue3

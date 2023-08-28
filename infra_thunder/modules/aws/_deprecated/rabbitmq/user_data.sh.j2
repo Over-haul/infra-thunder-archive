@@ -1,0 +1,124 @@
+#!/bin/bash
+source /opt/ivy/bash_functions.sh
+set_ivy_tag '{{ defaults["tag_namespace"] }}'
+set -x
+###
+### CONFIG ###
+###
+SERVICE='{{ defaults["stack"] }}'
+CLUSTER_NAME='{{ cluster_name }}'
+ENI_ID='{{ eni_id }}'
+NAME="${CLUSTER_NAME}-{server_index}"
+set_prompt_color '{{ defaults["prompt_color"] }}'
+PHASE='{{ defaults["phase"] }}'
+RABBITMQ_CONFIG_PATH='/etc/rabbitmq/rabbitmq.config'
+RABBITMQ_UN='guest'
+RABBITMQ_PW='guest'
+
+function setup_rabbitmq() {
+    mkdir -p /mnt/rabbitmq/{data,log}
+    chown rabbitmq:adm -R /mnt/rabbitmq
+    chmod 0755 -R /mnt/rabbitmq
+
+    INITIAL_HOSTS="'rabbit@${CLUSTER_NAME}-1','rabbit@${CLUSTER_NAME}-2','rabbit@${CLUSTER_NAME}-3'"
+
+    cat <<EOF >> ${RABBITMQ_CONFIG_PATH}
+[
+ {rabbit,
+   [
+   {cluster_partition_handling, autoheal},
+   {cluster_nodes,
+     {[${INITIAL_HOSTS}], disc}
+   },
+   {loopback_users, []}
+  ]}
+].
+EOF
+
+    cat <<EOF >> /etc/rabbitmq/enabled_plugins
+[rabbitmq_management].
+EOF
+
+    cat <<EOF >> /etc/rabbitmq/rabbitmq-env.conf
+RABBITMQ_MNESIA_BASE=/mnt/rabbitmq/data
+RABBITMQ_LOG_BASE=/mnt/rabbitmq/log
+EOF
+
+    cat <<EOF >> /etc/default/rabbitmq-server
+ulimit -n 100000
+EOF
+
+    cat <<EOF > /var/lib/rabbitmq/.erlang.cookie
+{{ erlang_cookie }}
+EOF
+
+    chown rabbitmq:adm /var/lib/rabbitmq/.erlang.cookie
+    chmod 400 /var/lib/rabbitmq/.erlang.cookie
+}
+
+function setup_new_relic() {
+    yum install -y nri-rabbitmq
+    cat <<EOF > /etc/newrelic-infra/integrations.d/rabbitmq-config.yml
+integration_name: com.newrelic.rabbitmq
+
+instances:
+  - name: ${CLUSTER_NAME}
+    command: "all"
+    arguments:
+      hostname: localhost
+      port: 15672
+      username: ${RABBITMQ_UN}
+      password: ${RABBITMQ_PW}
+      config_path: ${RABBITMQ_CONFIG_PATH}
+      queues_regexes: '[".*"]'
+      exchanges_regexes: '[".*"]'
+      vhosts_regexes: '[".*"]'
+EOF
+    systemctl restart newrelic-infra
+}
+
+function setup_consul() {
+    cat <<EOF > /opt/ivy/rabbit_healthcheck.sh
+#!/bin/bash
+/usr/bin/curl -sSf http://${RABBITMQ_UN}:${RABBITMQ_PW}@localhost:15672/api/aliveness-test/%2F > /dev/null
+exit \$?
+EOF
+
+    chmod +x /opt/ivy/rabbit_healthcheck.sh
+
+    # Register with Consul
+    cat <<EOF > "/etc/consul.d/${SERVICE}.json"
+{
+  "service": {
+    "id": "${NAME}",
+    "name": "${CLUSTER_NAME}",
+    "tags": [
+      "${PHASE}",
+      "$(get_availability_zone)"
+    ],
+    "port": 5672,
+    "check": {
+      "id": "health",
+      "name": "cluster_status",
+      "script": "/opt/ivy/rabbit_healthcheck.sh",
+      "interval": "15s"
+    }
+  }
+}
+EOF
+
+bash /opt/ivy/configure_consul.sh
+}
+
+
+attach_eni $(get_instance_id) ${ENI_ID}
+
+set_hostname ${NAME}
+
+setup_consul
+
+setup_rabbitmq
+systemctl start rabbitmq-server
+systemctl enable rabbitmq-server
+
+setup_new_relic

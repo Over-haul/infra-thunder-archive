@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "oh-aws-us-west-2-sandbox-dev"
+version = "0.0.1"
+description = "Infra Thunder Example"
+authors = ["Infra Thunder Admins <admin@nodomain.local>"]
+
+[tool.poetry.dependencies]
+python = "~3.9.0"
+infra-thunder = {git = "git@github.com:Over-haul/infra-thunder-public.git", rev = "0.0.1", extras = ["aws"]}
+#infra-thunder = { path = "/local/path/to/infra-thunder-public", extras = ["aws"], develop = true }
+
+[tool.poetry.dev-dependencies]
+poethepoet = "^0.11.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"

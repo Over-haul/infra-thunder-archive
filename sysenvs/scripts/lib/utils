@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC1090,SC1091
+GITROOT=$(git rev-parse --show-toplevel)
+. "${GITROOT}"/scripts/lib/strict-mode
+strictMode
+
+ANSI_NO_COLOR=$'\033[0m'
+
+function msg_info() {
+  local GREEN=$'\033[0;32m'
+  printf "%s\n" "${GREEN}${*}${ANSI_NO_COLOR}" >&2
+}
+
+function msg_warn() {
+  local YELLOW=$'\033[0;33m'
+  printf "%s\n" "${YELLOW}${*}${ANSI_NO_COLOR}" >&2
+}
+
+function msg_error() {
+  local RED=$'\033[0;31m'
+  printf "%s\n" "${RED}${*}${ANSI_NO_COLOR}" >&2
+}
+
+function msg_fatal() {
+  msg_error "${*}"
+  exit 1
+}
+
+function return_non_empty_array() {
+  declare -a INPUT
+  # https://stackoverflow.com/questions/7577052/bash-empty-array-expansion-with-set-u
+  INPUT=("${@+"${@}"}")
+  if [[ ${#INPUT[@]} -ne 0 ]]; then
+    printf "%s\n" "${INPUT[@]}"
+  fi
+}
+
+function create_menu() {
+  select option; do # in "$@" is the default
+    # shellcheck disable=SC2076,SC2199
+    if [[ " ${@} " =~ " ${option} " ]]; then
+      msg_info "You selected ${option} which is option ${REPLY}"
+      echo -n "${option}"
+      break
+    else
+      msg_fatal "Incorrect Input: Select a number 1-${#}"
+    fi
+  done
+}
+
+function select_asg() {
+  local STACK_NAME="${1}"
+  local TMP_DIR="${2}"
+  local FIRST="${3:-no}"
+  local ASG_NAME
+  local ASG_FILE
+  declare -a ASGS ASG_NAMES
+  ASGS=()
+  ASG_NAMES=()
+  while IFS= read -r asg; do
+    ASGS+=("${asg}")
+    ASG_NAMES+=("$(get_asg_name "${asg}")")
+  done < <(get_asgs "${STACK_NAME}" "${TMP_DIR}")
+  ASG_FILE="${ASGS[0]}"
+  if [[ "${FIRST}" == 'no' ]]; then
+    ASG_NAME="$(create_menu "${ASG_NAMES[@]}")"
+    for i in "${!ASGS[@]}"; do
+      # shellcheck disable=SC2076
+      if [[ "${ASGS[${i}]}" =~ "${ASG_NAME}" ]]; then
+        ASG_FILE="${ASGS[${i}]}"
+        break
+      fi
+    done
+  fi
+  echo -n "${ASG_FILE}"
+}
+
+function get_asgs() {
+  local STACK_NAME="${1}"
+  local TMP_DIR="${2}"
+  local ASG_JSON="${TMP_DIR}/asg.json"
+  local QUERY
+  QUERY="AutoScalingGroups[?starts_with(AutoScalingGroupName, \`${STACK_NAME}\`) == \`true\`]"
+  aws autoscaling describe-auto-scaling-groups --query "${QUERY}" --output json > "${ASG_JSON}"
+  declare -a ASGS=()
+  while IFS= read -r asg; do
+    if [[ -n ${asg} ]]; then
+      local ASG_FILE
+      ASG_FILE="${TMP_DIR}/$(jq -r '.AutoScalingGroupName' <<<"${asg}" ).json"
+      echo "${asg}" > "${ASG_FILE}"
+      ASGS+=("${ASG_FILE}")
+    fi
+  done < <(jq -c '.[]' "${ASG_JSON}")
+  msg_info "${STACK_NAME} has ${#ASGS[@]} Auto Scaling Group(s)"
+  # https://stackoverflow.com/questions/7577052/bash-empty-array-expansion-with-set-u
+  return_non_empty_array "${ASGS[@]+"${ASGS[@]}"}"
+}
+
+function get_asg_name() {
+  local ASG_FILE="${1}"
+  jq -r '.AutoScalingGroupName' "${ASG_FILE}"
+}
+
+function get_asg_lt_id() {
+  local ASG_FILE="${1}"
+  jq -r '.LaunchTemplate.LaunchTemplateId // .MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification.LaunchTemplateId' \
+    "${ASG_FILE}"
+}
+
+function get_lt_version_from_latest() {
+  local LT_ID="${1}"
+  # shellcheck disable=SC2016
+  aws ec2 describe-launch-template-versions --versions '$Latest' \
+      --launch-template-id "${LT_ID}" --output text \
+      --query 'LaunchTemplateVersions[0].VersionNumber'
+}
+
+function get_lt_version_from_asg_file() {
+  local ASG_FILE="${1}"
+  jq -r '.LaunchTemplate.Version // .MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification.Version' \
+    "${ASG_FILE}"
+}
+
+function get_asg_lt_version() {
+  local ASG_FILE="${1}"
+  local LT_VERSION
+  LT_VERSION="$(get_lt_version_from_asg_file "${ASG_FILE}")"
+  # shellcheck disable=SC2016
+  if [[ "${LT_VERSION}" == '$Latest' ]]; then
+    local LT_ID
+    LT_ID="$(get_asg_lt_id "${ASG_FILE}")"
+    LT_VERSION="$(get_lt_version_from_latest "${LT_ID}")"
+  fi
+  echo -n "${LT_VERSION}"
+}
+
+function output_user_data() {
+  local USERDATA_FILE="${1}"
+  case "$(file "${USERDATA_FILE}")" in
+    ${USERDATA_FILE}:\ gzip\ compressed\ data*)
+      gunzip < "${USERDATA_FILE}"
+      ;;
+    ${USERDATA_FILE}:*ASCII\ text*)
+      cat "${USERDATA_FILE}"
+      ;;
+    *)
+      msg_fatal "Unknown file type: $(file "${USERDATA_FILE}")" >&2
+      ;;
+  esac
+}
+
+function get_user_data() {
+  local ASG_FILE="${1}"
+  local TMP_DIR="${2}"
+  local LT_ID LT_VERSION USERDATA_FILE
+  LT_ID="$(get_asg_lt_id "${ASG_FILE}")"
+  LT_VERSION="$(get_lt_version_from_asg_file "${ASG_FILE}")"
+  USERDATA_FILE="${TMP_DIR}/userdata"
+  aws ec2 describe-launch-template-versions --versions "${LT_VERSION}" \
+      --launch-template-id "${LT_ID}" --output text \
+      --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' | \
+      base64 --decode > "${USERDATA_FILE}"
+  output_user_data "${USERDATA_FILE}"
+}
+
+function get_instances_in_asg() {
+  local ASG_FILE="${1}"
+  local TMP_DIR="${2}"
+  local ASG_NAME
+  ASG_NAME="$(get_asg_name "${ASG_FILE}")"
+  declare -a INSTANCES=()
+  while IFS= read -r i; do
+    local INSTANCE
+    INSTANCE="${TMP_DIR}/$(jq -r '.InstanceId' <<<"${i}" ).json"
+    echo "${i}" > "${INSTANCE}"
+    INSTANCES+=("${INSTANCE}")
+  done < <(jq -c '.Instances[]' "${ASG_FILE}")
+  msg_info "${ASG_NAME} has ${#INSTANCES[@]} instance(s)"
+  # https://stackoverflow.com/questions/7577052/bash-empty-array-expansion-with-set-u
+  return_non_empty_array "${INSTANCES[@]+"${INSTANCES[@]}"}"
+}
+
+function get_old_instances_in_asg() {
+  local ASG_FILE="${1}"
+  local TMP_DIR="${2}"
+  local ASG_LT_VERSION ASG_NAME
+  ASG_LT_VERSION="$(get_asg_lt_version "${ASG_FILE}")"
+  ASG_NAME="$(get_asg_name "${ASG_FILE}")"
+  declare -a INSTANCES=()
+  while IFS= read -r i; do
+    local INSTANCE_LT_VERSION
+    INSTANCE_LT_VERSION="$(get_instance_lt_version "${i}")"
+    if [[ "${ASG_LT_VERSION}" != "${INSTANCE_LT_VERSION}" ]]; then
+      INSTANCES+=("${i}")
+    else
+      msg_info "Instance $(get_instance_id "${i}") is already on current version"
+    fi
+  done < <(get_instances_in_asg "${ASG_FILE}" "${TMP_DIR}")
+  msg_info "${ASG_NAME} has ${#INSTANCES[@]} instance(s) NOT using version ${ASG_LT_VERSION}"
+  # https://stackoverflow.com/questions/7577052/bash-empty-array-expansion-with-set-u
+  return_non_empty_array "${INSTANCES[@]+"${INSTANCES[@]}"}"
+}
+
+function get_old_instances() {
+  local STACK_NAME="${1}"
+  local TMP_DIR="${2}"
+  declare -a ASGS=() INSTANCES=()
+  while IFS= read -r asg; do
+    while IFS= read -r i; do
+       INSTANCES+=("${i}")
+    done < <(get_old_instances_in_asg "${asg}" "${TMP_DIR}")
+  done < <(get_asgs "${STACK_NAME}" "${TMP_DIR}")
+  msg_info "There are ${#INSTANCES[@]} instance(s) to work on"
+  # https://stackoverflow.com/questions/7577052/bash-empty-array-expansion-with-set-u
+  return_non_empty_array "${INSTANCES[@]+"${INSTANCES[@]}"}"
+}
+
+function get_instance_lt_version() {
+  local INSTANCE_FILE="${1}"
+  jq -r '.LaunchTemplate.Version' "${INSTANCE_FILE}"
+}
+
+function get_instance_id() {
+  local INSTANCE_FILE="${1}"
+  jq -r '.InstanceId' "${INSTANCE_FILE}"
+}
+
+function get_k8s_node_name() {
+  local INSTANCE_ID="${1}"
+  local NODE_LABEL JSON_PATH
+  JSON_PATH='{.items[0].metadata.name}'
+  NODE_LABEL="node.kubernetes.io/instance-id=${INSTANCE_ID}"
+  kubectl get nodes -l "${NODE_LABEL}" -o jsonpath="${JSON_PATH}" 2>/dev/null
+}
+
+function get_operatingsystem() {
+  local kernel_name
+  kernel_name="$(uname)"
+  case "${kernel_name}" in
+    Linux)
+      echo -n 'linux'
+      ;;
+    Darwin)
+      echo -n 'macos'
+      ;;
+    *)
+      msg_fatal "Sorry, ${kernel_name} is not supported."
+      ;;
+  esac
+}
+
+function create_temp_dir() {
+  local DIR_NAME="${1}"
+  case "$(get_operatingsystem)" in
+    linux)
+      echo -n "$(mktemp -dt "${DIR_NAME}.XXXX")"
+      ;;
+    macos)
+      echo -n "$(/usr/bin/mktemp -dt "${DIR_NAME}")"
+      ;;
+    *)
+      msg_fatal "Sorry, $(uname) is not supported."
+      ;;
+  esac
+}
+
+function get_user_reply() {
+  local QUESTION="${1}"
+  local RESET="\033[0m"
+  local BOLD="\033[1m"
+  local YELLOW="\033[38;5;11m"
+  local USER_REPLY
+  read -p "$(echo -e "${BOLD}${YELLOW}${QUESTION}${RESET}[Y or N] ")" -n 1 -r USER_REPLY
+  echo -n "${USER_REPLY}"
+}
+
+function is_k8s_available() {
+  local CHECK_K8S="${1:-yes}"
+  local CURRENT_K8S_CONTEXT
+  CURRENT_K8S_CONTEXT="$(kubectl config current-context)"
+  msg_warn "I will be working with kubernetes context: ${CURRENT_K8S_CONTEXT}"
+  local K8S_IS_AVAILABLE='no'
+  if [[ "${CHECK_K8S}" == 'yes' ]]; then
+    if kubectl --request-timeout='2s' get nodes &>/dev/null; then
+      K8S_IS_AVAILABLE='yes'
+    fi
+  fi
+  echo -n "${K8S_IS_AVAILABLE}"
+}
+
+function terminate_instance() {
+  local INSTANCE_ID="${1}"
+  local ACTION="${2:-replace}"
+  if [ "${ACTION}" == 'replace' ]; then
+    msg_info "terminating ${INSTANCE_ID} and replacing..."
+    aws autoscaling terminate-instance-in-auto-scaling-group \
+      --no-should-decrement-desired-capacity --instance-id "${INSTANCE_ID}"
+  else
+    msg_info "terminating ${INSTANCE_ID} and decrementing...";
+    aws autoscaling terminate-instance-in-auto-scaling-group \
+      --should-decrement-desired-capacity --instance-id "${INSTANCE_ID}"
+  fi
+}
+
+function cordon_or_drain_instance() {
+  local INSTANCE_FILE="${1}"
+  local ASK="${2-yes}"
+  local ACTION="${3:-cordon}"
+  local EXECUTE_ACTION='Y'
+  local INSTANCE_ID
+  declare -a KUBECTL_ARGS=()
+  if [[ "${ACTION}" == 'drain' ]]; then
+    KUBECTL_ARGS+=('--ignore-daemonsets')
+    KUBECTL_ARGS+=('--delete-emptydir-data')
+  fi
+  INSTANCE_ID="$(get_instance_id "${INSTANCE_FILE}")"
+  if NODE_NAME="$(get_k8s_node_name "${INSTANCE_ID}")"; then
+    if [[ "${ASK}" == 'yes' ]]; then
+      EXECUTE_ACTION="$(get_user_reply "Can I ${ACTION} ${NODE_NAME} now?")"
+      echo
+    fi
+    if [[ ${EXECUTE_ACTION} =~ ^[Yy]$ ]]; then
+      # See this https://stackoverflow.com/questions/7577052/bash-empty-array-expansion-with-set-u
+      # for an explanation of `"${KUBECTL_ARGS[@]+"${KUBECTL_ARGS[@]}"}"`
+      kubectl "${ACTION}" "${KUBECTL_ARGS[@]+"${KUBECTL_ARGS[@]}"}" "${NODE_NAME}"
+    else
+      msg_info "I did NOT ${ACTION} ${NODE_NAME}"
+    fi
+  else
+    msg_info "Instance ID ${INSTANCE_ID} is not part of k8s cluster $(kubectl config current-context)"
+  fi
+}
+
+function handle_instance() {
+  local INSTANCE_FILE="${1}"
+  local ASK="${2-yes}"
+  local ACTION="${3:-replace}"
+  local EXECUTE_ACTION='Y'
+  local INSTANCE_ID
+  INSTANCE_ID="$(get_instance_id "${INSTANCE_FILE}")"
+  if [[ "${ASK}" == "yes" ]]; then
+    EXECUTE_ACTION="$(get_user_reply "Can I ${ACTION} ${INSTANCE_ID} now?")"
+    echo
+  fi
+  if [[ ${EXECUTE_ACTION} =~ ^[Yy]$ ]]; then
+    terminate_instance "${INSTANCE_ID}" "${ACTION}"
+  else
+    msg_info "I did NOT ${ACTION} ${INSTANCE_ID}"
+  fi
+}
+
+function retire_instance() {
+  local INSTANCE_FILE="${1}"
+  local ACTION="${2:-replace}"
+  local ASK="${3:-yes}"
+  local IS_K8S_AVAILABLE="${4:-no}"
+  if [[ "${IS_K8S_AVAILABLE}" == 'yes' ]]; then
+    cordon_or_drain_instance "${INSTANCE_FILE}" "${ASK}" 'drain'
+  fi
+  handle_instance "${INSTANCE_FILE}" "${ASK}" "${ACTION}"
+}

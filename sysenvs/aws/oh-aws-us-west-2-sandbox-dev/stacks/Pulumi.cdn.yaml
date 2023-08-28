@@ -1,0 +1,17 @@
+---
+encryptionsalt: v1:<REDACTED>
+config:
+  cdn:zones:
+    - name: example.com
+      records:
+        - name: sandbox-dev
+          proxied: true
+          ttl: 1
+          type: CNAME
+          value: default.oh-aws-us-west-2-sandbox-dev.example.com
+        - name: '*.sandbox-dev'
+          proxied: true
+          ttl: 1
+          type: CNAME
+          value: default.oh-aws-us-west-2-sandbox-dev.example.com
+  thunder:provider: cloudflare

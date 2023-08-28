@@ -1,0 +1,10 @@
+---
+encryptionsalt: v1:<REDACTED>
+config:
+  aws:region: us-west-2
+  transitgateway:connections:
+    - allowed_sysenvs:
+        - aws-us-east-1-app-prod
+        - aws-us-east-1-app-dev
+      profile: oh-aws-tools-prod
+      sysenv: oh-aws-us-west-2-tools-prod

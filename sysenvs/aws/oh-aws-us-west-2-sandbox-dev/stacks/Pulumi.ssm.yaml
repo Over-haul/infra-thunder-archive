@@ -1,0 +1,9 @@
+---
+encryptionsalt: v1:<REDACTED>
+config:
+  aws:region: us-west-2
+  ssm:parameters:
+    DD_API_KEY:
+      secure: v1:<REDACTED>
+    DD_APP_KEY:
+      secure: v1:<REDACTED>

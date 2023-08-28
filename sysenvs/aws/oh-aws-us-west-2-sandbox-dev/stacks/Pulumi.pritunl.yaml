@@ -1,0 +1,9 @@
+---
+encryptionsalt: v1:<REDACTED>
+config:
+  aws:region: us-west-2
+  pritunl:allow_ssh_from_anywhere: "false"
+  pritunl:client_subnets:
+    - 10.24.255.0/24
+  pritunl:instance_type: t3.medium
+  pritunl:server_id: the-uuid-you-generated-without-hyphens

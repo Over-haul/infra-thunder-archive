@@ -1,0 +1,67 @@
+---
+# Github Jekyll configuration file
+title: "Thunder"
+remote_theme: just-the-docs/just-the-docs@v0.4.0.rc3
+# remote_theme: vsoch/mkdocs-jekyll
+aux_links:
+  "AMI Bakery":
+    - "//github.com/Over-haul/ami-bakery"
+  "Github":
+    - "//github.com/over-haul/infra-thunder-public"
+callouts:
+  admonition:
+    color: grey-lt
+  attention:
+    title: Attention
+    color: purple
+  caution:
+    title: Caution
+    color: yellow
+  danger:
+    title: Danger
+    color: red
+  error:
+    title: Error
+    color: red
+  highlight:
+    color: yellow
+    opacity: 0.5
+  hint:
+    title: Hint
+    color: grey-dk
+  important:
+    title: Important
+    color: green
+  note:
+    title: Note
+    color: blue
+  tip:
+    title: Tip
+    color: grey-dk
+  warning:
+    title: Warning
+    color: red
+exclude:
+  - venv3/
+  - venv/
+  - .idea/
+# for ruinning locally
+plugins:
+  - jekyll-remote-theme
+  - jekyll-coffeescript
+  - jekyll-commonmark-ghpages
+  - jekyll-gist
+  - jekyll-github-metadata
+  - jekyll-paginate
+  - jekyll-relative-links
+  - jekyll-optional-front-matter
+  - jekyll-readme-index
+  - jekyll-default-layout
+  - jekyll-titles-from-headings
+readme_index:
+  enabled: true
+  remove_originals: false
+  with_frontmatter: true
+markdown: kramdown
+kramdown:
+  input: GFM

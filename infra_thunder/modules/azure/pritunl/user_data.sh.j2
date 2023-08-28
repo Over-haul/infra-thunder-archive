@@ -1,0 +1,129 @@
+#!/bin/bash
+set -x
+
+# TODO: this bash script is modified to not need our AMI. Fix this!
+
+###
+### CONFIG ###
+###
+
+SERVER_ID='{{ server_id }}'
+MONGODB_SECRET_URI='{{ mongo_connection_secret_uri }}'
+
+function setup_nat() {
+  sysctl -w net.ipv4.ip_forward=1
+  sed -i -e 's/net.ipv4.ip_forward = 0/net.ipv4.ip_forward = 1/' /etc/sysctl.conf
+}
+
+function setup_volume() {
+  local DEVICE="/dev/disk/azure/scsi1/lun1"
+  local MOUNT_PATH="/mnt/data"
+
+  # check if volume needs formatting (DANGEROUS!)
+  # we'll use 'file' to check if the device lacks the ext4 magic
+  if ! file -sL ${DEVICE} | grep -q "ext4"; then
+    echo "Device needs formatting..."
+    mkfs.ext4 ${DEVICE}
+    if [ $? -ne 0 ]; then
+      echo "Error formatting volume, aborting"
+      exit 1
+    fi
+  fi
+
+  # Mount to ${MOUNT_PATH}
+  if [ ! -d ${MOUNT_PATH} ]; then
+    mkdir -p ${MOUNT_PATH}
+  fi
+  mount ${DEVICE} ${MOUNT_PATH}
+  if [ $? -ne 0 ]; then
+    echo "Error mounting volume, aborting"
+    exit 1
+  fi
+
+  # check if storage folders exist in mounted volume
+  if [ ! -d ${MOUNT_PATH}/mongo ]; then
+    mkdir -p ${MOUNT_PATH}/mongo
+    chown -R mongod: ${MOUNT_PATH}/mongo
+  fi
+
+  # remove the symlink or real dir and replace it with a symlink
+  rm -rf /var/lib/mongo
+  ln -s /mnt/data/mongo /var/lib/mongo
+
+  local FSTAB="${DEVICE} ${MOUNT_PATH} ext4 defaults 0 0"
+  sed -i '/${DEVICE}/d' /etc/fstab
+  echo ${FSTAB} >> /etc/fstab
+}
+
+function install_azure_cli() {
+  rpm --import https://packages.microsoft.com/keys/microsoft.asc
+  tee /etc/yum.repos.d/azure-cli.repo << EOF
+[azure-cli]
+name=Azure CLI
+baseurl=https://packages.microsoft.com/yumrepos/azure-cli
+enabled=1
+gpgcheck=1
+gpgkey=https://packages.microsoft.com/keys/microsoft.asc
+EOF
+
+  dnf install -y azure-cli
+  # log in via identity
+  az login --identity
+}
+
+function install_pritunl() {
+  tee /etc/yum.repos.d/mongodb-org-4.4.repo << EOF
+[mongodb-org-4.2]
+name=MongoDB Repository
+baseurl=https://repo.mongodb.org/yum/redhat/8/mongodb-org/4.4/x86_64/
+gpgcheck=1
+enabled=1
+gpgkey=https://www.mongodb.org/static/pgp/server-4.4.asc
+EOF
+
+  tee /etc/yum.repos.d/pritunl.repo << EOF
+[pritunl]
+name=Pritunl Repository
+baseurl=https://repo.pritunl.com/stable/yum/oraclelinux/8/
+gpgcheck=1
+enabled=1
+EOF
+
+  dnf -y install oracle-epel-release-el8
+  yum-config-manager --enable oracle-epel-release-el8
+
+  systemctl stop firewalld.service
+  systemctl disable firewalld.service
+
+  gpg --keyserver hkp://keyserver.ubuntu.com --recv-keys 7568D9BB55FF9E5287D586017AE645C0CF8E292A
+  gpg --armor --export 7568D9BB55FF9E5287D586017AE645C0CF8E292A > key.tmp
+  rpm --import key.tmp
+  rm -f key.tmp
+
+  dnf -y --allowerasing install pritunl-openvpn pritunl mongodb-org
+}
+
+function configure_pritunl() {
+  if [ -n "${MONGODB_SECRET_URI}" ]; then
+    mongo_url="$(az keyvault secret show --id \"${MONGODB_SECRET_URI}\" --query 'value' -o tsv)"
+    pritunl set-mongodb "${mongo_url}"
+  else
+    sed -i -e "s/.*bindIp: 127.0.0.1.*/  bindIp: 0.0.0.0/" /etc/mongod.conf
+    pritunl set-mongodb "mongodb://localhost:27017/pritunl"
+    systemctl start mongod
+    systemctl enable mongod
+  fi
+
+  echo "${SERVER_ID}" > /var/lib/pritunl/pritunl.uuid
+
+  systemctl start pritunl
+  systemctl enable pritunl
+}
+
+setup_nat
+setup_volume
+
+install_azure_cli
+install_pritunl
+
+configure_pritunl

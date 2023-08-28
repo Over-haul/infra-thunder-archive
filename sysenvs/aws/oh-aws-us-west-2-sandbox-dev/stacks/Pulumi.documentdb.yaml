@@ -1,0 +1,9 @@
+---
+encryptionsalt: v1:<REDACTED>
+config:
+  aws:region: us-west-2
+  documentdb:clusters:
+    - count: 3
+      engine_version: 4.0.0
+      instance_type: db.t3.medium
+      name: app

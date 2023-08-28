@@ -1,0 +1,562 @@
+#!/bin/bash
+set -x
+
+# TODO: this is a temp fix to make the bash functions work properly
+sed -i -e "s#2019-06-01' || false#2019-06-01' > /dev/null 2>\&1 || false#" /opt/ivy/bash_functions.sh
+# END HACK
+
+source /opt/ivy/bash_functions.sh
+set_ivy_tag '{{ defaults["tag_namespace"] }}'
+set_prompt_color '{{ defaults["prompt_color"] }}'
+
+###
+### CONFIG ###
+###
+SERVICE='{{ defaults["stack"] }}'
+
+# Begin SSM parameter list (colon delimited fs name and full ssm path)
+VAULT_PARAM_PATHS=()
+{%- for name, uri in vault_secrets.items() %}
+VAULT_PARAM_PATHS+=( "{{ name }}:{{ uri }}" )
+{%- endfor %}
+# End SSM parameter list
+
+# Cluster configuration parameters
+CLUSTER_NAME='{{ cluster_name }}'
+CLUSTER_DOMAIN='{{ cluster_domain }}'
+CLUSTER_DNS='{{ cluster_dns }}'
+LB_ENDPOINT_NAME='{{ lb_endpoint }}'
+INTERNAL_ENDPOINT_NAME='{{ internal_endpoint }}'
+SYSENV_ZONE='{{ sysenv_zone }}'
+SERVICE_CIDR='{{ service_cidr }}'
+API_SERVICE_IP='{{ api_service_ip }}'
+
+{#BACKUPS_PATH='{{ backups_path }}'#}
+
+# Build hostname - use the short name
+NAME="$(get_name | tr '_' '-')"
+
+# datadog parameters
+{#DD_FORWARD_AUDIT_LOGS='{{ dd_forward_audit_logs }}'#}
+
+# e2d parameters
+{#E2D_SNAPSHOT_RETENTION_TIME='{{ e2d_snapshot_retention_time }}'#}
+E2D_SNAPSHOT_RETENTION_TIME="1w"
+
+# Constants
+KUBERNETES_CONFIG_PATH="/etc/kubernetes"
+
+# setup some hax
+mkdir -p ${KUBERNETES_CONFIG_PATH}/etcd/pki
+mkdir -p ${KUBERNETES_CONFIG_PATH}/pki
+
+function download_vault_secrets() {
+  # Download vault secrets to local files
+  # Split the key:value pairs and store them on disk
+  for kvp in "${VAULT_PARAM_PATHS[@]}" ; do
+    name=${kvp%%:*}
+    # replace last dash with a dot, and lowercases them
+    fs_path=$(echo -n "${name}" | sed -r -e 's/-([^-]*)$/.\1/' | tr '[:upper:]' '[:lower:]')
+    vault_uri=${kvp#*:}
+    # recursively make the directory where the output should live
+    #mkdir -p $(dirname ${KUBERNETES_CONFIG_PATH}/pki/${fs_path})
+    get_keyvault_key "${vault_uri}" > ${KUBERNETES_CONFIG_PATH}/pki/${fs_path}
+  done
+
+  # protect the keys - keys become only readable by kubernetes user/group (and root of course)
+  find ${KUBERNETES_CONFIG_PATH} -name '*.key' -exec chown kubernetes: {} \; -exec chmod 0660 {} \;
+}
+
+function setup_internal_endpoint() {
+  # update the internal DNS endpoint used for controller comms
+  # get the ips from the vmss and reshape them into `[{ipv4Address: 10.10.10.10}, ...]` to be fed into azure dns
+  local IPS=$(az vmss nic list --resource-group $(get_resource_group) --vmss-name $(get_vmss_name) -o json --query "[?primary].ipConfigurations[0].{ipv4Address: privateIpAddress}")
+  # split the endpoint name (a.sysenv.domain.com -> a)
+  local DNS_PREFIX=${INTERNAL_ENDPOINT_NAME%%.*}
+  # update the dns record
+  az network dns record-set a update -n ${DNS_PREFIX} -g $(get_resource_group) -z ${SYSENV_ZONE} --set "ARecords=${IPS}"
+}
+
+function setup_kube_common() {
+  # Configure the common kubernetes sysconfig files
+  # set the kube-common variables for all components
+  local KUBE_COMMON=/etc/sysconfig/kube-common
+  # TODO HACK: set ENDPOINT to the name of the internal (dns based) endpoint
+  update_env ${KUBE_COMMON} "ENDPOINT" "${INTERNAL_ENDPOINT_NAME}"
+  update_env ${KUBE_COMMON} "CLUSTER_NAME" "${CLUSTER_NAME}"
+  update_env ${KUBE_COMMON} "SERVICE_CIDR" "${SERVICE_CIDR}"
+  update_env ${KUBE_COMMON} "CLUSTER_DOMAIN" "${CLUSTER_DOMAIN}"
+  update_env ${KUBE_COMMON} "CLUSTER_DNS" "${CLUSTER_DNS}"
+
+  # TODO: hack for now, use double dashes to denote directory structure?
+  mv ${KUBERNETES_CONFIG_PATH}/pki/etcd-ca.crt ${KUBERNETES_CONFIG_PATH}/etcd/pki/ca.crt
+  mv ${KUBERNETES_CONFIG_PATH}/pki/etcd-ca.key ${KUBERNETES_CONFIG_PATH}/etcd/pki/ca.key
+
+  # setup kube-pki
+  local KUBE_PKI=/etc/sysconfig/kube-pki
+  update_env ${KUBE_PKI} "ETCD_CA" "${KUBERNETES_CONFIG_PATH}/etcd/pki/ca.crt"
+  update_env ${KUBE_PKI} "ETCD_CA_KEY" "${KUBERNETES_CONFIG_PATH}/etcd/pki/ca.key"
+  update_env ${KUBE_PKI} "KUBE_CA" "${KUBERNETES_CONFIG_PATH}/pki/ca.crt"
+  update_env ${KUBE_PKI} "KUBE_CA_KEY" "${KUBERNETES_CONFIG_PATH}/pki/ca.key"
+  update_env ${KUBE_PKI} "PROXY_CA" "${KUBERNETES_CONFIG_PATH}/pki/proxy-ca.crt"
+  update_env ${KUBE_PKI} "PROXY_CA_KEY" "${KUBERNETES_CONFIG_PATH}/pki/proxy-ca.key"
+  update_env ${KUBE_PKI} "SERVICE_ACCOUNT_PUB" "${KUBERNETES_CONFIG_PATH}/pki/service-account.pem"
+  update_env ${KUBE_PKI} "SERVICE_ACCOUNT_KEY" "${KUBERNETES_CONFIG_PATH}/pki/service-account.key"
+}
+
+function setup_e2d() {
+  local SNAPSHOT_RETENTION_TIME=$1
+  # PKI subjects for etcd certs
+  ETCD_SANS="
+${LB_ENDPOINT_NAME}
+${INTERNAL_ENDPOINT_NAME}
+$(hostname -f)
+"
+  # add localhost to the list to allow local healthchecking/cli access
+  ETCD_IPS="
+127.0.0.1
+$(get_ip_from_interface $(get_default_interface))
+"
+
+  # generate certs with SANs
+  generate_pki "${KUBERNETES_CONFIG_PATH}" "etcd/pki/server" "etcd server" "etcd" "server" "etcd/pki/ca.crt" "etcd/pki/ca.key" "${ETCD_SANS}" "${ETCD_IPS}"
+  # no need to generate a peer certificate since the server certificates are valid for server/client usage
+  # we just present our server cert to another server and everything's all right (hey, I know you!)
+  #generate_pki "${KUBERNETES_CONFIG_PATH}" "etcd/pki/peer" "etcd peer" "etcd" "server" "etcd/pki/ca.crt" "etcd/pki/ca.key" "${ETCD_SANS}" "${ETCD_IPS}"
+
+  # launch with hostname set to regional endpoint name and advertise-client-urls
+  local E2D=/etc/sysconfig/e2d
+
+  # add some randomness to the node name since rerovisioned VMSS machines keep same hostname/IP but have no data
+  # otherwise, e2d expects a data directory and cannot recover since the old node still exists in the etcd cluster member list
+  update_env ${E2D} "E2D_NAME" "${NAME}-$(xxd -l 2  -ps /dev/urandom)"
+
+  # TODO!!
+  #update_env ${E2D} "E2D_SNAPSHOT_BACKUP_URL" "${BACKUPS_PATH}"
+  update_env ${E2D} "E2D_SNAPSHOT_RETENTION_TIME" "${SNAPSHOT_RETENTION_TIME}"
+
+  local E2D_PEER_PORT="7980"
+  local VMSS_PEERS=$(retry az vmss nic list --resource-group $(get_resource_group) --vmss-name $(get_vmss_name) -o tsv --query "[?primary].ipConfigurations[0].join('', [privateIpAddress, ':${E2D_PEER_PORT}']) | join(',', @)")
+  update_env ${E2D} "E2D_BOOTSTRAP_ADDRS" "${VMSS_PEERS}"
+
+  update_env ${E2D} "E2D_SERVER_CERT" "${KUBERNETES_CONFIG_PATH}/etcd/pki/server.crt"
+  update_env ${E2D} "E2D_SERVER_KEY" "${KUBERNETES_CONFIG_PATH}/etcd/pki/server.key"
+  update_env ${E2D} "E2D_PEER_CERT" "${KUBERNETES_CONFIG_PATH}/etcd/pki/server.crt"
+  update_env ${E2D} "E2D_PEER_KEY" "${KUBERNETES_CONFIG_PATH}/etcd/pki/server.key"
+}
+
+function setup_kube_apiserver() {
+  # PKI subjects for apiserver certs
+  # Keep in mind, apiserver is accessed in-cluster and out of the cluster
+  # so it needs a lot of SANs for the internal dns hierarchy, as well as any external clients.
+  # Technically, the regional SAN isn't required, but it helps for debugging direct communications with a faulty controller
+  APISERVER_SANS="
+${LB_ENDPOINT_NAME}
+${INTERNAL_ENDPOINT_NAME}
+$(hostname -f)
+kubernetes
+kubernetes.default
+kubernetes.default.svc
+kubernetes.default.svc.${CLUSTER_DOMAIN}
+kubernetes.default.svc.cluster.local
+"
+  # add localhost to the list to allow local healthchecking
+  APISERVER_IPS="
+127.0.0.1
+$(get_ip_from_interface $(get_default_interface))
+${API_SERVICE_IP}
+"
+  # generate the client key apiserver needs to talk to the etcd servers, generates pki/etcd-apiserver.{crt,key}
+  generate_pki "${KUBERNETES_CONFIG_PATH}" "pki/etcd-apiserver" "kube-apiserver" "masters" "client" "etcd/pki/ca.crt" "etcd/pki/ca.key"
+
+  # generates pki/apiserver.{crt,key} for kubelet,controllers -> apiserver and apiserver -> kubelet
+  generate_pki "${KUBERNETES_CONFIG_PATH}" "pki/apiserver" "kubernetes" "thunder:$(get_region)" "server" "pki/ca.crt" "pki/ca.key" "${APISERVER_SANS}" "${APISERVER_IPS}"
+
+  # now, generate a kubelet client certificate for apiserver -> kubelet comms (fetching logs, etc)
+  # -- no need, we present apiserver's cert to the kubelet (WITNESS ME!)
+  #generate_pki "${KUBERNETES_CONFIG_PATH}" "pki/apiserver-kubelet" "kube-apiserver" "system:kubelet-api-admin" "client" "pki/ca.crt" "pki/ca.key"
+
+  # generates pki/proxy.{crt,key} for apiserver -> aggregated apiserver client auth
+  generate_pki "${KUBERNETES_CONFIG_PATH}" "pki/proxy" "kube-apiserver-proxy" "masters" "client" "pki/proxy-ca.crt" "pki/proxy-ca.key"
+
+  # configure the environment variables needed
+  local KUBE_APISERVER=/etc/sysconfig/kube-apiserver
+  update_env ${KUBE_APISERVER} "ETCD_CLIENT_CERT" "${KUBERNETES_CONFIG_PATH}/pki/etcd-apiserver.crt"
+  update_env ${KUBE_APISERVER} "ETCD_CLIENT_KEY" "${KUBERNETES_CONFIG_PATH}/pki/etcd-apiserver.key"
+  update_env ${KUBE_APISERVER} "TLS_CERT_FILE" "${KUBERNETES_CONFIG_PATH}/pki/apiserver.crt"
+  update_env ${KUBE_APISERVER} "TLS_PRIVATE_KEY_FILE" "${KUBERNETES_CONFIG_PATH}/pki/apiserver.key"
+  update_env ${KUBE_APISERVER} "PROXY_CLIENT_CERT_FILE" "${KUBERNETES_CONFIG_PATH}/pki/proxy.crt"
+  update_env ${KUBE_APISERVER} "PROXY_CLIENT_KEY_FILE" "${KUBERNETES_CONFIG_PATH}/pki/proxy.key"
+
+  # TODO: this removes the aws iam auth from the azure instances, remove this once rebaked
+  update_env /etc/sysconfig/aws-iam-authenticator "AWS_AUTH_HOOK_CONFIG" ""
+
+  # create audit policy
+  mkdir -p "${KUBERNETES_CONFIG_PATH}/audit-policies/"
+  cat <<EOT > "${KUBERNETES_CONFIG_PATH}/audit-policies/policy.yaml"
+apiVersion: audit.k8s.io/v1
+kind: Policy
+rules:
+    # do not log requests to the following
+    - level: None
+      nonResourceURLs:
+          - '/healthz*'
+          - '/logs'
+          - '/metrics'
+          - '/swagger*'
+          - '/version'
+
+    # limit level to Metadata so token is not included in the spec/status
+    - level: Metadata
+      omitStages:
+          - RequestReceived
+      resources:
+          - group: authentication.k8s.io
+            resources:
+                - tokenreviews
+
+    # extended audit of auth delegation
+    - level: RequestResponse
+      omitStages:
+          - RequestReceived
+      resources:
+          - group: authorization.k8s.io
+            resources:
+                - subjectaccessreviews
+
+    # log changes to pods at RequestResponse level
+    - level: RequestResponse
+      omitStages:
+          - RequestReceived
+      resources:
+          # core API group; add third-party API services and your API services if needed
+          - group: ''
+            resources: ['pods']
+            verbs: ['create', 'patch', 'update', 'delete']
+
+    # log everything else at Metadata level
+    - level: Metadata
+      omitStages:
+          - RequestReceived
+EOT
+}
+
+function setup_kube_controller_manager() {
+  # Handles many control loops - PV, CSRs, Service Accounts, creating pods from DaemonSets/Jobs, HPA, and more.
+  # issue the controller manager client cert, generates pki/controller-manager.{crt,key} to auth to apiserver
+  # CN=system:kube-controller-manager O=thunder:zone:us-west-2a
+  generate_pki "${KUBERNETES_CONFIG_PATH}" "pki/controller-manager" "system:kube-controller-manager" "thunder:zone:$(get_region)" "client" "pki/ca.crt" "pki/ca.key"
+
+  generate_component_kubeconfig ${KUBERNETES_CONFIG_PATH} kube-controller-manager.yaml pki/controller-manager.crt pki/controller-manager.key ${INTERNAL_ENDPOINT_NAME} "kube-controller-manager-$(get_region)"
+
+  # configure environment variables needed
+  update_env /etc/sysconfig/kube-controller-manager "KUBECONFIG" ${KUBERNETES_CONFIG_PATH}/kube-controller-manager.yaml
+}
+
+function setup_kube_scheduler() {
+  # Handles assigning pods to nodes based on capacity
+  # issue kube-scheduler client cert, generates pki/scheduler.{crt,key} to auth to apiserver
+  # CN=system:kube-scheduler O=thunder:zone:us-west-2a
+  generate_pki "${KUBERNETES_CONFIG_PATH}" "pki/scheduler" "system:kube-scheduler" "thunder:zone:$(get_region)" "client" "pki/ca.crt" "pki/ca.key"
+
+  generate_component_kubeconfig ${KUBERNETES_CONFIG_PATH} kube-scheduler.yaml pki/scheduler.crt pki/scheduler.key ${INTERNAL_ENDPOINT_NAME} "kube-scheduler-$(get_region)"
+
+  # configure environment variables
+  update_env /etc/sysconfig/kube-scheduler "KUBECONFIG" ${KUBERNETES_CONFIG_PATH}/kube-scheduler.yaml
+}
+
+function setup_cloud_lifecycle_controller() {
+  # Handles removing cloud nodes after they're deleted in the provider
+  # issue cloud-lifecycle-controller client cert, generates pki/cloud-lifecycle-controller.{crt,key} to auth to apiserver
+  # TODO: find better privileges other than system:masters for this component!
+  # CN=cloud-lifecycle-controller-us-west-2a O=system:masters
+  generate_pki "${KUBERNETES_CONFIG_PATH}" "pki/cloud-lifecycle-controller" "cloud-lifecycle-controller-$(get_region)" "system:masters" "client" "pki/ca.crt" "pki/ca.key"
+
+  generate_component_kubeconfig ${KUBERNETES_CONFIG_PATH} cloud-lifecycle-controller.yaml pki/cloud-lifecycle-controller.crt pki/cloud-lifecycle-controller.key ${INTERNAL_ENDPOINT_NAME} "cloud-lifecycle-controller-$(get_region)"
+
+  # configure environment variables
+  update_env /etc/sysconfig/cloud-lifecycle-controller "KUBECONFIG" ${KUBERNETES_CONFIG_PATH}/cloud-lifecycle-controller.yaml
+  update_env /etc/sysconfig/cloud-lifecycle-controller "CLOUD" "aws"
+}
+
+function setup_controller_kubelet() {
+  # Runs pods on the controller
+  # generate a pki cert using the node's hostname as the username to match the advertised name
+  # CN=system:node:{node hostname} O=system:nodes
+  generate_pki "${KUBERNETES_CONFIG_PATH}" "pki/kubelet" "system:node:${NAME}" "system:nodes" "client" "pki/ca.crt" "pki/ca.key"
+
+  generate_component_kubeconfig ${KUBERNETES_CONFIG_PATH} kubelet/kubeconfig.yaml pki/kubelet.crt pki/kubelet.key ${INTERNAL_ENDPOINT_NAME} "${NAME}"
+
+  # taint this kubelet with control-plane:NoSchedule to prevent random containers from scheduling on it
+  update_env /etc/sysconfig/kubelet "KUBELET_EXTRA_ARGS" "--register-with-taints 'node-role.kubernetes.io/master=true:NoSchedule,node-role.kubernetes.io/control-plane=true:NoSchedule'"
+}
+
+function setup_datadog_controller() {
+  local DD_API_KEY=$1
+  local DD_FORWARD_AUDIT_LOGS=$2
+
+  # TODO: migrate this to datadog's ENC secrets function
+  set_datadog_key ${DD_API_KEY}
+
+  # generate a pki cert to use to talk to the kubelet (must match generated role name)
+  # CN=system:node:{node hostname} O=system:nodes
+  generate_pki "${KUBERNETES_CONFIG_PATH}" "pki/controller-monitoring" "thunder:controller-monitoring" "thunder:controller-monitoring" "client" "pki/ca.crt" "pki/ca.key"
+
+  # generate a kubeconfig file to
+  generate_component_kubeconfig ${KUBERNETES_CONFIG_PATH} controller-monitoring.yaml pki/controller-monitoring.crt pki/controller-monitoring.key ${INTERNAL_ENDPOINT_NAME} "${NAME}"
+
+  # hotpatch until new ami built:
+  # add the dd-agent to the journal group to allow it to forward logs
+  usermod -a -G systemd-journal dd-agent
+
+  # configure the datadog agent
+  cat <<EOT >> /etc/datadog-agent/datadog.yaml
+# set the cluster name (to make some of the dd precreated dashboards work)
+cluster_name: "${CLUSTER_NAME}"
+
+# configure datadog to talk to kube-apiserver to fetch events and tags from services/endpoints
+kubernetes_kubeconfig_path: ${KUBERNETES_CONFIG_PATH}/controller-monitoring.yaml
+# elect a leader amongst the controllers
+leader_election: true
+# the leader will collect k8s events and send them to dd
+collect_kubernetes_events: true
+
+# configure datadog to talk to the kubelet for tags
+kubernetes_kubelet_host: 127.0.0.1
+kubernetes_https_kubelet_port: 10250
+# the kubelet tls serving cert (generated via csr) is valid for the ip of the node, but we want to use localhost, ignore tls verification
+kubelet_tls_verify: false
+kubelet_client_ca: ${KUBERNETES_CONFIG_PATH}/pki/ca.crt
+kubelet_client_crt: ${KUBERNETES_CONFIG_PATH}/pki/controller-monitoring.crt
+kubelet_client_key: ${KUBERNETES_CONFIG_PATH}/pki/controller-monitoring.key
+
+config_providers:
+ # autodiscover pods with annotations to scrape
+ - name: kubelet
+   polling: true
+ # watch kubernetes service objects for cluster checks
+ - name: kube_services
+   polling: true
+
+# logging configuration
+logs_enabled: true
+logs_config:
+  # collect logs from all containers
+  container_collect_all: true
+
+# apm configuration
+apm_config:
+  enabled: true
+EOT
+
+  # enable datadog built-in kubernetes_state_metrics check (no need to deploy kube-state-metrics)
+  mkdir /etc/datadog-agent/conf.d/kubernetes_state_core.d
+  cat <<EOT > /etc/datadog-agent/conf.d/kubernetes_state_core.d/kubernetes_state_core.yaml.default
+# this enables the built-in kube state metrics check
+# there is no need to deploy kube state metrics into the cluster if this file is present
+# note: this uses the kubeconfig file defined in datadog.yaml
+init_config:
+instances:
+  - collectors:
+    - secrets
+    - nodes
+    - pods
+    - services
+    - resourcequotas
+    - replicationcontrollers
+    - limitranges
+    - persistentvolumeclaims
+    - persistentvolumes
+    - namespaces
+    - endpoints
+    - daemonsets
+    - deployments
+    - replicasets
+    - statefulsets
+    - cronjobs
+    - jobs
+    - horizontalpodautoscalers
+    - poddisruptionbudgets
+    - storageclasses
+    - volumeattachments
+EOT
+
+  # blacklist mount point to remove permission denied warns in logs
+  mv /etc/datadog-agent/conf.d/disk.d/conf.yaml.default /etc/datadog-agent/conf.d/disk.d/conf.yaml
+  cat <<EOT > /etc/datadog-agent/conf.d/disk.d/conf.yaml
+init_config:
+instances:
+  - use_mount: false
+    mount_point_blacklist:
+    - /var/lib/kubelet/(pods|plugins)/
+    - /run/docker/runtime-runc/moby/
+EOT
+
+  # enable monitoring etcd
+  # TODO: this uses the etcd server's certificate itself, generate a read-only cert for metrics later
+  cat <<EOT > /etc/datadog-agent/conf.d/etcd.d/conf.yaml
+init_config:
+instances:
+  # use 127.0.0.1 here because the ssl cert we generate doesn't include localhost, oops.
+  - prometheus_url: https://127.0.0.1:2379/metrics
+    tls_verify: false
+    tls_ignore_warning: true
+    tls_cert: ${KUBERNETES_CONFIG_PATH}/etcd/pki/server.crt
+    tls_private_key: ${KUBERNETES_CONFIG_PATH}/etcd/pki/server.key
+    tls_ca_cert: ${KUBERNETES_CONFIG_PATH}/etcd/pki/ca.crt
+EOT
+
+  # enable monitoring apiserver metrics
+  cat <<EOT > /etc/datadog-agent/conf.d/kube_apiserver_metrics.d/conf.yaml
+init_config:
+instances:
+  # use 127.0.0.1 here because the ssl cert we generate doesn't include localhost, oops.
+  - prometheus_url: https://127.0.0.1:443/metrics
+    bearer_token_auth: false
+    tls_verify: false
+    tls_ignore_warning: true
+    tls_cert: ${KUBERNETES_CONFIG_PATH}/pki/controller-monitoring.crt
+    tls_private_key: ${KUBERNETES_CONFIG_PATH}/pki/controller-monitoring.key
+    tls_ca_cert: ${KUBERNETES_CONFIG_PATH}/pki/ca.crt
+EOT
+
+  # enable monitoring kubernetes apiserver
+  cat <<EOT > /etc/datadog-agent/conf.d/kubernetes_apiserver.d/conf.yaml
+init_config:
+instances:
+  # this is required, since it doesn't default to true(??)
+  # also, note: this uses the kubeconfig file defined in datadog.yaml
+  - collect_events: true
+EOT
+
+  # enable monitoring controller manager
+  cat <<EOT > /etc/datadog-agent/conf.d/kube_controller_manager.d/conf.yaml
+init_config:
+instances:
+  - prometheus_url: http://localhost:10252/metrics
+EOT
+
+  # enable monitoring scheduler
+  cat <<EOT > /etc/datadog-agent/conf.d/kube_scheduler.d/conf.yaml
+init_config:
+instances:
+  - prometheus_url: http://localhost:10251/metrics
+EOT
+
+  # enable monitoring kubelet pod/cadvisor metrics, and kubelet itself
+  #mv /etc/datadog-agent/conf.d/kubelet.d/conf.yaml.example /etc/datadog-agent/conf.d/kubelet.d/conf.yaml
+  cat <<EOT > /etc/datadog-agent/conf.d/kubelet.d/conf.yaml
+init_config:
+instances:
+  # use 127.0.0.1 here because the ssl cert kubelet requests doesn't include localhost
+  - cadvisor_metrics_endpoint: https://127.0.0.1:10250/metrics/cadvisor
+    kubelet_metrics_endpoint: https://127.0.0.1:10250/metrics
+EOT
+
+  # enable datadog to read from journal
+  mkdir /etc/datadog-agent/conf.d/journald.d/
+  cat <<EOT > /etc/datadog-agent/conf.d/journald.d/conf.yaml
+logs:
+  - type: journald
+    container_mode: true
+EOT
+
+  # enable network performance monitoring
+  enable_datadog_network_monitoring
+
+  if [[ "${DD_FORWARD_AUDIT_LOGS}" == 'true' ]]; then
+    # enable datadog to read kube-apiserver's audit log
+    mkdir -p /etc/datadog-agent/conf.d/kubernetes_auditlog.d/
+    cat <<EOT > /etc/datadog-agent/conf.d/kubernetes_auditlog.d/conf.yaml
+logs:
+ - type: file
+   path: /var/log/kubernetes/apiserver.audit.log
+   source: kubernetes.audit
+   service: kube-apiserver-audit
+EOT
+  fi
+}
+
+function node_exists() {
+  grep "${NAME}" <<< "$(kubectl --kubeconfig ${KUBERNETES_CONFIG_PATH}/kubelet/kubeconfig.yaml get nodes)" &> /dev/null
+  return $?
+}
+
+function mark_controller_kubelet() {
+  # Wait for apiserver to be active
+  until systemctl is-active kube-apiserver && node_exists; do
+    echo "Waiting for apiserver before marking self as control plane node..."
+    # TODO: wait for nodes api group, potentially forever
+    sleep 5
+  done
+
+  # Mark self as a controller node
+  # Kubelet won't let you supply node-role at join time, but the system:nodes kubeconfig has permission to label itself (?)
+  kubectl --kubeconfig ${KUBERNETES_CONFIG_PATH}/kubelet/kubeconfig.yaml label nodes ${NAME} "node-role.kubernetes.io/master=" "node-role.kubernetes.io/control-plane="
+}
+
+function inject_datadog_secrets() {
+  local DD_API_KEY=$1
+  local DD_APP_KEY=$2
+
+  # sync the DD api key into kubernetes as a secret in the kube-system namespace
+  # instead of using kubectl create secret, which will not update secrets that exist, we use kubectl to
+  # create the yaml and use kubectl apply to 'upsert' the file
+  kubectl \
+    -n "kube-system" \
+    create secret generic "datadog" \
+    --from-literal "api-key=${DD_API_KEY}" \
+    --from-literal "app-key=${DD_APP_KEY}" \
+    --dry-run=client -o yaml | kubectl --kubeconfig ${KUBERNETES_CONFIG_PATH}/controller-monitoring.yaml apply -f - || true
+}
+
+# do the thing!
+set_hostname "${NAME}"
+
+# configure networking - only necessary because amzn linux doesn't have udev rules for azure devices
+# TODO: fixme?
+cat <<EOT > /etc/sysconfig/network-scripts/ifcfg-eth1
+DEVICE=eth1
+BOOTPROTO=dhcp
+ONBOOT=yes
+TYPE=Ethernet
+DEFROUTE=no
+EOT
+ifup eth1
+
+# log into azure, and keep retrying
+retry az login --identity
+
+## Configure K8s controller
+# get the pki certs
+download_vault_secrets
+setup_internal_endpoint
+setup_kube_common
+# setup components
+setup_e2d "${E2D_SNAPSHOT_RETENTION_TIME}"
+setup_kube_apiserver
+setup_kube_controller_manager
+setup_kube_scheduler
+setup_cloud_lifecycle_controller
+setup_controller_kubelet
+
+# set up datadog
+# TODO: need name for vault params?
+#DATADOG_API_KEY=$(get_ssm_param "${PARAMETER_STORE_COMMON}/DD_API_KEY")
+#DATADOG_APP_KEY=$(get_ssm_param "${PARAMETER_STORE_COMMON}/DD_APP_KEY")
+#setup_datadog_controller "${DATADOG_API_KEY}" "${DD_FORWARD_AUDIT_LOGS}"
+
+## Start the controller components
+#systemctl enable --now datadog-agent
+systemctl enable --now docker
+systemctl enable --now e2d
+systemctl enable --now kube-apiserver
+systemctl enable --now kube-controller-manager
+systemctl enable --now kube-scheduler
+#systemctl enable --now cloud-lifecycle-controller
+
+systemctl enable --now kubelet
+
+mark_controller_kubelet
+# inject the datadog secrets into k8s kv, must be done after apiserver is started
+#inject_datadog_secrets "${DATADOG_API_KEY}" "${DATADOG_APP_KEY}"

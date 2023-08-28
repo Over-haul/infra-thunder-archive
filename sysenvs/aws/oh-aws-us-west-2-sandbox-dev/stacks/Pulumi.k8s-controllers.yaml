@@ -1,0 +1,15 @@
+---
+encryptionsalt: v1:<REDACTED>
+config:
+  ami:name_prefix_override: oh-kubernetes-1.22
+  aws:region: us-west-2
+  k8s-controllers:clusters:
+    - enable_clusterip_routes: true
+      service_cidr: 10.24.192.0/21
+      docker_registry_cache: http://container-registry-cache.container-registry.svc.oh-aws-us-west-2-sandbox-dev.oh:5000
+      instance_type: c6a.xlarge
+      rootfs_size_gb: 100
+      extra_namespaces:
+        - data
+      node_termination_webhook_url:
+        secure: v1:<REDACTED>

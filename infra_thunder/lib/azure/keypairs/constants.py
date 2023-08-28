@@ -1,0 +1,3 @@
+DEFAULT_KEY_PAIR_NAME = "default"
+DEFAULT_ADMIN_USERNAME = "thunder"
+DEFAULT_ADMIN_KEY_PATH = f"/home/{DEFAULT_ADMIN_USERNAME}/.ssh/authorized_keys"

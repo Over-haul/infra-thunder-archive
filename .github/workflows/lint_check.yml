@@ -1,0 +1,25 @@
+---
+name: Run lint check
+on:
+  push:
+    branches:
+      - develop
+      - main
+  pull_request:
+jobs:
+  run-tests:
+    name: Run lint check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      - name: Run lint check
+        shell: bash
+        run: |-
+          echo "Python version is $(python -V)"
+          pip install --upgrade pip wheel poetry
+          poetry install
+          poetry run poe format-check

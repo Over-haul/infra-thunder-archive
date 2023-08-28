@@ -1,0 +1,10 @@
+.venv
+.idea
+.vscode
+.pycache
+.DS_Store
+*.iml
+*.pyc
+state/
+*.egg-info
+.python-version

@@ -1,0 +1,125 @@
+#!/bin/bash
+set -x
+source /opt/ivy/bash_functions.sh
+set_ivy_tag '{{ defaults["tag_namespace"] }}'
+###
+### CONFIG ###
+###
+CLUSTER_NAME='{{ cluster_name }}'
+ENV_CLUSTER_NAME='{{ env_cluster_name }}'
+NAME="${CLUSTER_NAME}-$(get_instance_id)"
+set_hostname "${NAME}"
+set_prompt_color '{{ defaults["prompt_color"] }}'
+ZONE="$(get_availability_zone)"
+IVY_NAMESPACE="$(get_ivy_tag)"
+REGION="$(get_region)"
+PHASE='{{ defaults["phase"] }}'
+
+function setup_data_volume() {
+    local EBS_DEVICE="/dev/sdf"
+    local NVME_DEVICE="/dev/nvme0n1"
+    local MOUNT_PATH="/mnt/data"
+
+    # autodetect extra block devices or NVME devices
+    if [ ! -b ${EBS_DEVICE} -a ! -b ${NVME_DEVICE} ]; then
+        echo "No data volume, continuing with local storage only";
+        return 1;
+    else
+        if [ -b ${NVME_DEVICE} ]; then
+            # if we have a NVME device AND an extra EBS device, use NVME only
+            DEVICE=${NVME_DEVICE}
+        else
+            DEVICE=${EBS_DEVICE}
+        fi
+    fi
+
+    mkfs.xfs ${DEVICE}
+    mkdir -p ${MOUNT_PATH}
+    mount ${DEVICE} ${MOUNT_PATH}
+    mkdir -p ${MOUNT_PATH}/elasticsearch
+    chown elasticsearch: ${MOUNT_PATH}/elasticsearch
+
+    rm -rf /var/lib/elasticsearch
+    ln -s ${MOUNT_PATH}/elasticsearch /var/lib/elasticsearch
+
+    local FSTAB="${DEVICE} ${MOUNT_PATH} xfs defaults 0 0"
+    sed -i '/${DEVICE}/d' /etc/fstab
+    echo ${FSTAB} >> /etc/fstab
+
+}
+function setup_elasticsearch() {
+    cat <<EOF > /etc/elasticsearch/elasticsearch.yml
+cloud.aws.region: ${REGION}
+cluster.name: ${ENV_CLUSTER_NAME}
+"discovery.ec2.tag.${IVY_NAMESPACE}:phase": ${PHASE}
+"discovery.ec2.tag.${IVY_NAMESPACE}:service": ${CLUSTER_NAME}
+discovery.zen.hosts_provider: ec2
+#discovery.type: ec2
+node.attr.auto_attributes: true
+node.name: ${NAME}
+node.attr.rack: ${ZONE}
+network.bind_host: 0.0.0.0
+network.publish_host: "_eth0:ipv4_"
+script.update: true
+http.cors.enabled: true
+http.cors.allow-origin: /https?:\/\/.*(\.${IVY_NAMESPACE}|localhost)(:[0-9]+)?$/
+
+thread_pool.index.queue_size: 500
+thread_pool.bulk.queue_size: 500
+EOF
+
+    sed -i -e "s/^-Xmx.*/-Xmx$(get_ram_mb_by_percent .25)m/" -e "s/^-Xms.*/-Xms$(get_ram_mb_by_percent .25)m/" \
+        /etc/elasticsearch/jvm.options
+
+    echo "## Elasticsearch tweaks by cloud-init metadata" >> /etc/sysctl.conf
+    echo "vm.max_map_count=262144" >> /etc/sysctl.conf
+    sysctl -w vm.max_map_count=262144
+    echo "vm.swappiness=1" >> /etc/sysctl.conf
+    sysctl -w vm.swappiness=1
+
+    # Register with Consul
+    cat <<EOF > /etc/consul.d/${CLUSTER_NAME}.json
+{
+  "service": {
+    "id": "${NAME}",
+    "name": "${CLUSTER_NAME}",
+    "tags": [
+      "${PHASE}",
+      "${ZONE}"
+    ],
+    "port": 9300,
+    "check": {
+      "id": "${NAME}",
+      "name": "${CLUSTER_NAME}",
+      "http": "http://localhost:9200/_cluster/health?wait_for_nodes=ge(2)&timeout=10s",
+      "interval": "15s"
+    }
+  }
+}
+EOF
+    yum install -y nri-elasticsearch
+    cat <<EOF > /etc/newrelic-infra/integrations.d/elasticsearch-config.yml
+integration_name: com.newrelic.elasticsearch
+
+instances:
+  - name: elasticsearch
+    command: "all"
+    arguments:
+      cluster_environment: "${PHASE}"
+      config_path: "/etc/elasticsearch/elasticsearch.yml"
+      hostname: "localhost"
+      port: 9200
+      timeout: 30
+EOF
+}
+
+setup_data_volume
+setup_elasticsearch
+
+bash /opt/ivy/configure_consul.sh
+
+systemctl enable elasticsearch
+systemctl start elasticsearch
+
+
+systemctl restart newrelic-infra

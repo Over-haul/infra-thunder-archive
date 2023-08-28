@@ -1,0 +1,18 @@
+---
+MD013:
+  line_length: 2200
+MD033:
+  allowed_elements:
+    - table
+    - tbody
+    - tr
+    - th
+    - td
+    - br
+    - svg
+    - polygon
+    - path
+    - text
+    - defs
+    - filter
+    - feGaussianBlur

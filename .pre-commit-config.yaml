@@ -1,0 +1,48 @@
+---
+repos:
+  - repo: local
+    hooks:
+      - id: poe-format
+        name: poe-format
+        language: system
+        pass_filenames: false
+        entry: poetry
+        files: ^infra_thunder/
+        args:
+          - run
+          - poe
+          - format
+  - repo: https://github.com/lyz-code/yamlfix/
+    rev: 1.13.0
+    hooks:
+      - id: yamlfix
+        exclude: .*\.tpl\.yaml
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.4.0
+    hooks:
+      - id: detect-secrets
+        args:
+          - --baseline
+          - .secrets.baseline
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.4.0
+    hooks:
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        args:
+          - --markdown-linebreak-ext=.md
+      - id: check-added-large-files
+        args:
+          - --maxkb=512
+      - id: check-toml
+      - id: mixed-line-ending
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.35.0
+    hooks:
+      - id: markdownlint-fix
+  - repo: https://github.com/gruntwork-io/pre-commit
+    rev: v0.1.22
+    hooks:
+      - id: shellcheck
+        exclude: .*\.sh\.j2

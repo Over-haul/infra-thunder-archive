@@ -1,0 +1,8 @@
+---
+encryptionsalt: v1:<REDACTED>
+config:
+  aws:region: us-west-2
+  s3:buckets:
+    - acl: private
+      name: my-bucket
+      versioning: false

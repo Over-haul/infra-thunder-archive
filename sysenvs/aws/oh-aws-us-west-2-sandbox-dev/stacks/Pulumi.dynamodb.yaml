@@ -1,0 +1,10 @@
+---
+encryptionsalt: v1:<REDACTED>
+config:
+  aws:region: us-west-2
+  dynamodb:tables:
+    - attributes:
+        - name: id
+          type: NUMBER
+      hash_key: id
+      name: app

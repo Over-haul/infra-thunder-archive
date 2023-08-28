@@ -1,0 +1,154 @@
+#!/bin/bash
+set -x
+source /opt/ivy/bash_functions.sh
+set_ivy_tag '{{ defaults["tag_namespace"] }}'
+###
+### CONFIG ###
+###
+SERVICE='{{ defaults["stack"] }}'
+PARAMETER_STORE_COMMON='{{ defaults["parameter_store_common"] }}'
+NAME="${SERVICE}-$(get_instance_id)"
+SERVER_ID='{{ server_id }}'
+MONGODB='{{ ssm_connection_uri }}'
+set_prompt_color '{{ defaults["prompt_color"] }}'
+EBS_ID='{{ ebs_id }}'
+
+# TODO: Remove `set_datadog_key_and_site` once AMI with updated `set_datadog_key` is basked and ready to use.
+function set_datadog_key_and_site() {
+  local DD_API_KEY="${1}"
+  local DD_SITE="${2:-datadoghq.com}"
+  local DD_CONFIG_FILE="${3:-/etc/datadog-agent/datadog.yaml}"
+  cat <<EOF > "${DD_CONFIG_FILE}"
+api_key: ${DD_API_KEY}
+site: ${DD_SITE}
+bind_host: 0.0.0.0
+EOF
+}
+
+function setup_nat() {
+  sysctl -w net.ipv4.ip_forward=1
+  sed -i -e 's/net.ipv4.ip_forward = 0/net.ipv4.ip_forward = 1/' /etc/sysctl.conf
+}
+
+function do_setup_volume() {
+    local DEVICE="/dev/sdf"
+    local MOUNT_PATH="/mnt/data"
+
+    attach_ebs $(get_instance_id) ${EBS_ID} ${DEVICE}
+    if [ $? -ne 0 ]; then
+        echo "Error attach volume, aborting"
+        exit 1
+    fi
+
+    # check if volume needs formatting (DANGEROUS!)
+    # we'll use 'file' to check if the device lacks the ext4 magic
+    if ! file -sL ${DEVICE} | grep -q "ext4"; then
+        echo "Device needs formatting..."
+        mkfs.ext4 ${DEVICE}
+        if [ $? -ne 0 ]; then
+            echo "Error formatting volume, aborting"
+            exit 1
+        fi
+    fi
+
+    # Mount to ${MOUNT_PATH}
+    if [ ! -d ${MOUNT_PATH} ]; then
+        mkdir -p ${MOUNT_PATH}
+    fi
+    mount ${DEVICE} ${MOUNT_PATH}
+    if [ $? -ne 0 ]; then
+        echo "Error mounting volume, aborting"
+        exit 1
+    fi
+
+    # check if storage folders exist in mounted volume
+    if [ ! -d ${MOUNT_PATH}/mongo ]; then
+        mkdir -p ${MOUNT_PATH}/mongo
+    fi
+
+    local FSTAB="${DEVICE} ${MOUNT_PATH} ext4 defaults 0 0"
+    sed -i '/${DEVICE}/d' /etc/fstab
+    echo ${FSTAB} >> /etc/fstab
+}
+
+function setup_volume() {
+    if [ ! -z ${EBS_ID} ]; then
+        echo "Setting up data volume ${EBS_ID} ..."
+        do_setup_volume
+        echo "Configuring mongodb..."
+        rm -rf /var/lib/mongo
+        ln -s /mnt/data/mongo /var/lib/mongo
+        chown -R mongod: /mnt/data/mongo/
+        echo "Finished"
+    fi
+}
+
+function configure_pritunl() {
+    local MONGODB_URI
+    setup_nat
+    # Configure the data volume (UIDs and GIDs not created until install, so setup data volume after)
+    setup_volume
+    if [ ! -z ${MONGODB} ]; then
+        MONGODB_URI="$(get_ssm_param ${MONGODB} '--with-decryption')"
+    else
+        sed -i -e "s/.*bindIp: 127.0.0.1.*/  bindIp: 0.0.0.0/" /etc/mongod.conf
+        systemctl enable --now mongod
+        MONGODB_URI='mongodb://localhost:27017/pritunl'
+    fi
+
+    pritunl set-mongodb "${MONGODB_URI}"
+
+    echo "${SERVER_ID}" > /var/lib/pritunl/pritunl.uuid
+
+    systemctl enable --now pritunl
+}
+
+function setup_datadog_pritunl() {
+  local DD_SSM_PARAM=$1
+  local DD_SITE_SSM_PARAM=$2
+
+  local DD_API_KEY=$(get_ssm_param ${DD_SSM_PARAM})
+  local DD_SITE=$(get_ssm_param ${DD_SITE_SSM_PARAM})
+  # TODO: migrate this to datadog's ENC secrets function
+  # TODO: move back to `set_datadog_key` in `/opt/ivy/bash_functions.sh`.
+  set_datadog_key_and_site ${DD_API_KEY} ${DD_SITE}
+
+  # hotpatch until new ami built:
+  # add the dd-agent to the journal group to allow it to forward logs
+  usermod -a -G systemd-journal dd-agent
+
+  # configure the datadog agent
+  cat <<EOT >> /etc/datadog-agent/datadog.yaml
+# logging configuration
+logs_enabled: true
+EOT
+
+
+  # blacklist mount point to remove permission denied warns in logs
+  mv /etc/datadog-agent/conf.d/disk.d/conf.yaml.default /etc/datadog-agent/conf.d/disk.d/conf.yaml
+  cat <<EOT > /etc/datadog-agent/conf.d/disk.d/conf.yaml
+init_config:
+instances:
+  - use_mount: false
+    mount_point_blacklist:
+    - /var/lib/kubelet/(pods|plugins)/
+    - /run/docker/runtime-runc/moby/
+    - /var/lib/docker/(containers|overlay2)/
+    - /mnt/docker/(containers|overlay2)/
+    - /sys/kernel/debug/tracing
+EOT
+
+  # enable datadog to read from journal
+  mkdir /etc/datadog-agent/conf.d/journald.d/
+  cat <<EOT > /etc/datadog-agent/conf.d/journald.d/conf.yaml
+logs:
+  - type: journald
+    container_mode: true
+EOT
+}
+
+set_hostname ${NAME}
+# Configure Pritunl and start it
+configure_pritunl
+setup_datadog_pritunl "${PARAMETER_STORE_COMMON}/DD_API_KEY" "${PARAMETER_STORE_COMMON}/DD_SITE"
+systemctl enable --now datadog-agent

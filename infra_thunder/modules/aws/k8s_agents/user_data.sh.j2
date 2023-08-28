@@ -1,0 +1,297 @@
+#!/bin/bash
+set -x
+source /opt/ivy/bash_functions.sh
+set_ivy_tag '{{ defaults["tag_namespace"] }}'
+set_prompt_color '{{ defaults["prompt_color"] }}'
+
+###
+### CONFIG ###
+###
+SERVICE='{{ defaults["stack"] }}'
+PARAMETER_STORE_COMMON='{{ defaults["parameter_store_common"] }}'
+MONITORING_SECRET='{{ monitoring_secret }}'
+
+SSM_PARAM_PATHS=()
+# Begin SSM parameter list (colon delimited fs name and full ssm path)
+{%- for name, path in ssm_params %}
+SSM_PARAM_PATHS+=( "{{ name }}:{{ path }}" )
+{%- endfor %}
+# End SSM parameter list
+
+# Cluster configuration parameters
+CLUSTER_NAME='{{ cluster_name }}'
+CLUSTER_DOMAIN='{{ cluster_domain }}'
+CLUSTER_DNS='{{ cluster_dns }}'
+ENDPOINT_NAME='{{ endpoint_name }}'
+SERVICE_CIDR='{{ service_cidr }}'
+
+# Node configuration parameters
+NODEGROUP='{{ nodegroup }}'
+TAINTS="{{ taints | join(',') }}"
+BOOTSTRAP_ROLE_ARN='{{ bootstrap_role_arn }}'
+
+# Build hostname
+NAME="${SERVICE}-${NODEGROUP}-$(get_instance_id)"
+
+# Constants
+KUBERNETES_CONFIG_PATH="/etc/kubernetes"
+
+# TODO: Remove `set_datadog_key_and_site` once AMI with updated `set_datadog_key` is basked and ready to use.
+function set_datadog_key_and_site() {
+  local DD_API_KEY="${1}"
+  local DD_SITE="${2:-datadoghq.com}"
+  local DD_CONFIG_FILE="${3:-/etc/datadog-agent/datadog.yaml}"
+  cat <<EOF > "${DD_CONFIG_FILE}"
+api_key: ${DD_API_KEY}
+site: ${DD_SITE}
+bind_host: 0.0.0.0
+EOF
+}
+
+function download_ssm_params() {
+  # Download SSM parameters to local files
+  # Split the key:value pairs and store them on disk
+  for kvp in "${SSM_PARAM_PATHS[@]}" ; do
+    fs_path=${kvp%%:*}
+    ssm_path=${kvp#*:}
+    # recursively make the directory where the output should live
+    mkdir -p $(dirname ${KUBERNETES_CONFIG_PATH}/${fs_path})
+    get_ssm_param "${ssm_path}" > ${KUBERNETES_CONFIG_PATH}/${fs_path}
+  done
+
+  # protect the keys - keys become only readable by kubernetes user/group (and root of course)
+  find ${KUBERNETES_CONFIG_PATH} -name '*.key' -exec chown kubernetes: {} \; -exec chmod 0660 {} \;
+}
+
+function setup_kube_common() {
+  # Configure the common kubernetes sysconfig files
+  # set the kube-common variables for all components
+  local KUBE_COMMON=/etc/sysconfig/kube-common
+  update_env ${KUBE_COMMON} "ENDPOINT" "${ENDPOINT_NAME}"
+  update_env ${KUBE_COMMON} "CLUSTER_NAME" "${CLUSTER_NAME}"
+  update_env ${KUBE_COMMON} "SERVICE_CIDR" "${SERVICE_CIDR}"
+  update_env ${KUBE_COMMON} "CLUSTER_DOMAIN" "${CLUSTER_DOMAIN}"
+  update_env ${KUBE_COMMON} "CLUSTER_DNS" "${CLUSTER_DNS}"
+
+  # setup kube-pki
+  local KUBE_PKI=/etc/sysconfig/kube-pki
+  update_env ${KUBE_PKI} "KUBE_CA" "${KUBERNETES_CONFIG_PATH}/pki/ca.crt"
+}
+
+function complete_lf() {
+  local ACTION="${1:-CONTINUE}"
+  local INSTANCE_ID="${2}"
+  local LF_HOOK_NAME="${3}"
+  local ASG_NAME="${4}"
+  aws autoscaling complete-lifecycle-action \
+  --lifecycle-action-result "${ACTION}" \
+  --instance-id "${INSTANCE_ID}" \
+  --lifecycle-hook-name "${LF_HOOK_NAME}" \
+  --auto-scaling-group-name "${ASG_NAME}"
+}
+
+function instance_lifecycle_hook() {
+  local INSTANCE_ID ASG_NAME LF_HOOK_NAME WAIT='15'
+  INSTANCE_ID="$(get_instance_id)"
+  if ! ASG_NAME="$(aws autoscaling \
+      describe-auto-scaling-instances \
+      --instance-ids="${INSTANCE_ID}" \
+      --query 'AutoScalingInstances[0].AutoScalingGroupName' \
+      --output=text)"; then
+    echo "Could not find ASG for ${INSTANCE_ID}, skipping lifecycle action"
+    return 0
+  fi
+  LF_HOOK_NAME="$(aws autoscaling \
+    describe-lifecycle-hooks  \
+    --auto-scaling-group-name "${ASG_NAME}" \
+    --query 'LifecycleHooks[?LifecycleTransition==`autoscaling:EC2_INSTANCE_LAUNCHING`].LifecycleHookName' \
+    --output=text)"
+
+  until /opt/ivy/k8s-check.sh -s "${SERVICE}" &>/dev/null; do
+    echo "Waiting ${WAIT} seconds for K8s to be up before completing lifecycle action..."
+    sleep "${WAIT}"
+  done
+  complete_lf "CONTINUE" "${INSTANCE_ID}" \
+    "${LF_HOOK_NAME}" "${ASG_NAME}"
+}
+
+function setup_kubelet() {
+  local CLUSTER_NAME=$1
+  local ENDPOINT=$2
+  local BOOTSTRAP_ROLE_ARN=$3
+  if [ ! -z "${TAINTS}" ]; then
+    update_env /etc/sysconfig/kubelet "KUBELET_EXTRA_ARGS" "--register-with-taints '${TAINTS}'"
+  fi
+  # write out a kubeconfig
+  cat <<EOT > ${KUBERNETES_CONFIG_PATH}/kubelet/kubeconfig.yaml
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    certificate-authority: ${KUBERNETES_CONFIG_PATH}/pki/ca.crt
+    server: https://${ENDPOINT}:443
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: kubelet
+  name: kubelet
+current-context: kubelet
+users:
+- name: kubelet
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1alpha1
+      command: /bin/bash
+      args:
+        - -c
+        - |
+           /usr/bin/aws-iam-authenticator token \
+            -i "${CLUSTER_NAME}" \
+            -r "${BOOTSTRAP_ROLE_ARN}" \
+            -s $(hostname)
+EOT
+
+  # configure hairpinning for aws-vpc-cni
+  cat <<EOT > /etc/systemd/system/aws-vpc-cni-hairpinning.service
+[Unit]
+Description=aws-vpc-cni hairpinning
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/iptables -t mangle -A PREROUTING -i eth0 -m comment --comment "NXTLYTICS, hairpin all incoming" -j CONNMARK --set-xmark 0x80/0x80
+RemainAfterExit=true
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target
+EOT
+}
+
+function setup_datadog_node() {
+  local DD_SSM_PARAM=$1
+  local MONITORING_SECRET=$2
+  local DD_SITE_SSM_PARAM=$3
+
+  local DD_API_KEY=$(get_ssm_param ${DD_SSM_PARAM})
+  local DD_SITE=$(get_ssm_param ${DD_SITE_SSM_PARAM})
+  # TODO: migrate this to datadog's ENC secrets function
+  # TODO: move back to `set_datadog_key` in `/opt/ivy/bash_functions.sh`.
+  set_datadog_key_and_site ${DD_API_KEY} ${DD_SITE}
+
+  # fetch the auth token to talk to the local kubelet
+  local KUBELET_AUTH_TOKEN_PATH="${KUBERNETES_CONFIG_PATH}/kubelet/kubelet-auth.token"
+  # double curly braces here to escape the embedded go-template so jinja doesn't attempt to render that
+  # also, there cannot be any newlines in the output (ask me how long it took to debug this)
+  kubectl --kubeconfig ${KUBERNETES_CONFIG_PATH}/kubelet/kubeconfig.yaml get secret -n kube-system ${MONITORING_SECRET} -o go-template='{{ "{{ .data.token | base64decode }}" }}' | tr --delete '\n' > ${KUBELET_AUTH_TOKEN_PATH}
+
+  # hotpatch until new ami built:
+  # add the dd-agent to the journal group to allow it to forward logs
+  usermod -a -G systemd-journal dd-agent
+
+  # configure the datadog agent
+  cat <<EOT >> /etc/datadog-agent/datadog.yaml
+cluster_name: "${CLUSTER_NAME}"
+
+# configure datadog to talk to the kubelet
+kubernetes_kubelet_host: 127.0.0.1
+kubernetes_https_kubelet_port: 10250
+# the tls cert is valid for the ip of the node, but we want to use localhost, ignore tls verification
+kubelet_tls_verify: false
+kubelet_client_ca: ${KUBERNETES_CONFIG_PATH}/pki/ca.crt
+kubelet_auth_token_path: ${KUBELET_AUTH_TOKEN_PATH}
+
+# autodiscover pods with annotations to scrape
+config_providers:
+ - name: kubelet
+   polling: true
+
+# logging configuration
+logs_enabled: true
+logs_config:
+  # collect logs from all containers
+  container_collect_all: true
+
+# apm configuration
+apm_config:
+  enabled: true
+EOT
+
+
+  # blacklist mount point to remove permission denied warns in logs
+  mv /etc/datadog-agent/conf.d/disk.d/conf.yaml.default /etc/datadog-agent/conf.d/disk.d/conf.yaml
+  cat <<EOT > /etc/datadog-agent/conf.d/disk.d/conf.yaml
+init_config:
+instances:
+  - use_mount: false
+    mount_point_blacklist:
+    - /var/lib/kubelet/(pods|plugins)/
+    - /run/docker/runtime-runc/moby/
+    - /var/lib/docker/(containers|overlay2)/
+    - /mnt/docker/(containers|overlay2)/
+    - /sys/kernel/debug/tracing
+EOT
+
+  # enable monitoring kubelet pod/cadvisor metrics, and kubelet itself
+  #mv /etc/datadog-agent/conf.d/kubelet.d/conf.yaml.example /etc/datadog-agent/conf.d/kubelet.d/conf.yaml
+  cat <<EOT > /etc/datadog-agent/conf.d/kubelet.d/conf.yaml
+init_config:
+instances:
+  - cadvisor_metrics_endpoint: https://127.0.0.1:10250/metrics/cadvisor
+    kubelet_metrics_endpoint: https://127.0.0.1:10250/metrics
+EOT
+
+  # enable datadog to read from journal
+  mkdir /etc/datadog-agent/conf.d/journald.d/
+  cat <<EOT > /etc/datadog-agent/conf.d/journald.d/conf.yaml
+logs:
+  - type: journald
+    container_mode: true
+EOT
+}
+
+function setup_coredns_resolver() {
+  local COREDNS_IP="${1}"
+  /opt/ivy/set-dnsmasq-dhcp.sh --coredns-resolver ${COREDNS_IP}
+  systemctl restart dnsmasq
+}
+
+function setup_docker_gpu() {
+  local DOCKER_DAEMON_JSON='/etc/docker/daemon.json'
+  if nvidia-smi &> /dev/null; then
+    # we backup previous docker daemon config
+    cp "${DOCKER_DAEMON_JSON}" "${DOCKER_DAEMON_JSON}-$(date +"%m-%d-%Y")"
+    # we create a temp file with default-runtime appended to the object
+    jq '. + {"default-runtime": "nvidia"}' "${DOCKER_DAEMON_JSON}" > "${DOCKER_DAEMON_JSON}.tmp"
+    # we replace the docker daemon.json file
+    mv "${DOCKER_DAEMON_JSON}.tmp" "${DOCKER_DAEMON_JSON}"
+  fi
+}
+
+function setup_docker_cache() {
+  if [ ! -z "{{docker_registry_cache}}" ]; then
+    local DOCKER_DAEMON_JSON='/etc/docker/daemon.json'
+    cp "${DOCKER_DAEMON_JSON}" "${DOCKER_DAEMON_JSON}-$(date +"%m-%d-%Y")"
+    jq '. + {"registry-mirrors": ["{{docker_registry_cache}}"]}' "${DOCKER_DAEMON_JSON}" > "${DOCKER_DAEMON_JSON}.tmp"
+    mv "${DOCKER_DAEMON_JSON}.tmp" "${DOCKER_DAEMON_JSON}"
+  fi
+}
+
+# do the thing!
+set_hostname "${NAME}"
+# We run setup_docker_gpu before setup_docker_storage on purpose
+# In order for `"default-runtime": "nvidia"` to take effect
+# we need to restart docker, which setup_docker_storage does
+setup_docker_gpu
+setup_docker_cache
+setup_docker_storage "/dev/xvdb"
+download_ssm_params
+setup_kube_common
+setup_kubelet "${CLUSTER_NAME}" "${ENDPOINT_NAME}" "${BOOTSTRAP_ROLE_ARN}"
+setup_datadog_node "${PARAMETER_STORE_COMMON}/DD_API_KEY" "${MONITORING_SECRET}" "${PARAMETER_STORE_COMMON}/DD_SITE"
+setup_coredns_resolver "${CLUSTER_DNS}"
+systemctl enable --now datadog-agent
+systemctl enable --now aws-vpc-cni-hairpinning
+systemctl enable --now kubelet
+instance_lifecycle_hook

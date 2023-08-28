@@ -1,0 +1,4 @@
+---
+encryptionsalt: v1:<REDACTED>
+config:
+  thunder:shared: "true"

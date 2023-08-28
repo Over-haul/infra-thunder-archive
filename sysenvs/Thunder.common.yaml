@@ -1,0 +1,25 @@
+---
+#
+# Organization-wide Thunder parameters
+# No provider-specific configuration should be placed here.
+#
+
+# Override the cloud tag namespace (`{tag_namespace}:sysenv = "potato"`)
+tag_namespace: oh
+
+# Override the cloud tag separator (`myprefix{tag_separator} = "potato"`)
+# tag_separator: ':'
+
+# Set the default SysEnv namespace for all SysEnvs
+namespace: oh
+# Users with access to all SysEnvs
+ssh_users:
+  - name: user1
+    groups: [admin, cloud-users]
+    ssh_authorized_keys:
+      - "ssh-ed25519 <Public key here> user1@example.com"
+network_supernet: 10.0.0.0/8
+
+# public base domain for this sysenv. By default all names created by a stack
+# will be subadomains of this domain.
+public_base_domain: example.com

@@ -1,0 +1,5 @@
+---
+encryptionsalt: v1:<REDACTED>
+config:
+  aws:region: us-west-2
+  rds-postgres:instances: []

@@ -1,0 +1,10 @@
+---
+encryptionsalt: v1:<REDACTED>
+config:
+  aws:region: us-west-2
+  kinesis:streams:
+    - name: mystream123
+      retention_hours: 36
+      shards: 2
+    - name: mystream456
+      shards: 1

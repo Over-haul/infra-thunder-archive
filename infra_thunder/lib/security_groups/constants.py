@@ -1,0 +1,2 @@
+DEFAULT_SECURITY_GROUP = "DefaultSecurityGroup"
+ANY_IPV4_ADDRESS = "0.0.0.0/0"

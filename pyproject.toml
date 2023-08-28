@@ -1,0 +1,70 @@
+[tool.poetry]
+name = "infra_thunder"
+version = "0.0.1"
+description = "Modules to build a SysEnv using Pulumi"
+authors = ["Infra Thunder Admins <admin@nodomain.local>"]
+
+[tool.poetry.dependencies]
+python = "^3.9"
+pulumi = "3.9.1"
+pulumi-kubernetes = "3.5.1"
+pulumi-tls = "4.6.0"
+pulumi-datadog = "4.4.0"
+pulumi_random = "4.2.0"
+pulumi-aws = { version = "4.33.0", optional = true }
+pulumi-azure-native = { version = "1.28.0", optional = true }
+pulumi-azuread = { version = "5.7.0", optional = true }
+azure-core = { version = "1.19.0", optional = true }
+azure-mgmt-authorization = { version = "2.0.0", optional = true }
+kubernetes = "^12.0.1"
+dacite = "1.6.0"
+# Pinned because HiYaPyCo is not compatible with newer versions of Jinja2
+Jinja2 = "2.11.2"
+Sphinx = "3.3.1"
+HiYaPyCo = "^0.4.16"
+semver = "^2.8.1"
+wheel = "^0.37.0"
+jmespath = "^0.10.0"
+boto3 = "^1.20.26"
+click = "^8.0.3"
+click-option-group = "^0.5.3"
+grpcio = "^1.43.0"
+protobuf = "^3.19.3"
+# Pinned because we cannot bump to a new Jinja2 because of HiYaPyCo
+MarkupSafe = "2.0.1"
+pulumi-cloudflare = "^4.6.0"
+pulumi-postgresql = "^3.4.0"
+
+
+[tool.poetry.extras]
+aws = ["pulumi-aws"]
+azure = ["pulumi-azure-native", "pulumi-azuread", "azure-core", "azure-mgmt-authorization"]
+all = ["pulumi-aws", "pulumi-azure-native", "pulumi-azuread", "azure-core", "azure-mgmt-authorization"]
+
+[tool.poetry.group.dev.dependencies]
+poethepoet = "^0.11.0"
+black = "22.3.0"
+flake8 = "^4.0.1"
+
+[tool.poetry.scripts]
+infra_thunder = "infra_thunder.lib.cli:run"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 120
+target-version = ["py39"]
+
+[tool.yamlfix]
+line_length = 1000
+comments_min_spaces_from_content = 1
+flow_style_sequence = false
+sequence_style = "keep_style"
+preserve_quotes = true
+
+[tool.poe.tasks]
+format = { cmd = "black infra_thunder/", help = "Reformat code to conform with `black` code style standards" }
+format-check = { cmd = "black --check infra_thunder/", help = "Check if code conforms with `black` code style standards" }
+lint = { cmd = "flake8 infra_thunder/", help = "Check source code using code quality tools" }
